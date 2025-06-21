@@ -1,6 +1,7 @@
 using Mono.Cecil;
 using System.Text.Json;
 using System.Xml.Linq;
+using System;
 
 namespace DllMetadataExtractor;
 
@@ -8,6 +9,8 @@ public class Extractor
 {
     public string Extract(string assemblyPath)
     {
+        assemblyPath = ConvertWslPathToWindowsPath(assemblyPath);
+
         if (!File.Exists(assemblyPath))
         {
             return JsonSerializer.Serialize(new { error = "Assembly file not found." });
@@ -53,6 +56,17 @@ public class Extractor
         };
 
         return JsonSerializer.Serialize(metadata, new JsonSerializerOptions { WriteIndented = true, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });
+    }
+
+    private string ConvertWslPathToWindowsPath(string path)
+    {
+        if (OperatingSystem.IsWindows() && path.StartsWith("/mnt/") && path.Length > 6)
+        {
+            char driveLetter = path[5];
+            string restOfPath = path.Substring(6);
+            return $"{char.ToUpper(driveLetter)}:{restOfPath.Replace('/', '\\')}";
+        }
+        return path;
     }
 
     private Dictionary<string, string> LoadComments(string xmlPath)
