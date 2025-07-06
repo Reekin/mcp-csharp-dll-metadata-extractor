@@ -9,6 +9,11 @@ public class Extractor
 {
     public string Extract(string assemblyPath)
     {
+        return ExtractWithFilters(assemblyPath, null, null);
+    }
+
+    public string ExtractWithFilters(string assemblyPath, string[]? namespaces, string[]? classNames)
+    {
         assemblyPath = ConvertWslPathToWindowsPath(assemblyPath);
 
         if (!File.Exists(assemblyPath))
@@ -16,21 +21,119 @@ public class Extractor
             return JsonSerializer.Serialize(new { error = "Assembly file not found." });
         }
 
+        // Validate parameters
+        if (namespaces != null && classNames != null)
+        {
+            return JsonSerializer.Serialize(new { error = "Cannot specify both namespaces and classNames parameters. Use either namespaces for class-level info or classNames for member-level info." });
+        }
+
+        if (namespaces != null && namespaces.Length == 0)
+        {
+            return JsonSerializer.Serialize(new { error = "Namespaces array cannot be empty." });
+        }
+
+        if (classNames != null && classNames.Length == 0)
+        {
+            return JsonSerializer.Serialize(new { error = "ClassNames array cannot be empty." });
+        }
+
+        // Validate class name format
+        if (classNames != null)
+        {
+            foreach (var className in classNames)
+            {
+                if (string.IsNullOrWhiteSpace(className) || !className.Contains('.'))
+                {
+                    return JsonSerializer.Serialize(new { error = $"Invalid class name format: '{className}'. Expected format: 'Namespace.Class'." });
+                }
+            }
+        }
+
         var xmlDocPath = Path.ChangeExtension(assemblyPath, ".xml");
         var comments = LoadComments(xmlDocPath);
 
         var assembly = AssemblyDefinition.ReadAssembly(assemblyPath);
-        var metadata = new AssemblyMetadata
+        var allTypes = assembly.MainModule.Types
+            .Where(t => t.IsPublic && (t.IsClass || t.IsInterface))
+            .ToList();
+
+        // Mode 1: No filters - return namespace information
+        if (namespaces == null && classNames == null)
         {
-            Name = assembly.Name.Name,
-            Types = assembly.MainModule.Types
-                .Where(t => t.IsPublic && (t.IsClass || t.IsInterface))
+            var namespaceInfo = allTypes
+                .GroupBy(t => t.Namespace)
+                .Select(g => new NamespaceMetadata
+                {
+                    Name = g.Key,
+                    ClassCount = g.Count(),
+                    ClassNames = g.Select(t => t.Name).ToList()
+                })
+                .OrderBy(ns => ns.Name)
+                .ToList();
+
+            return JsonSerializer.Serialize(new { Namespaces = namespaceInfo }, 
+                new JsonSerializerOptions { WriteIndented = true, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });
+        }
+
+        // Mode 2: Filter by namespaces - return class information
+        if (namespaces != null && classNames == null)
+        {
+            var availableNamespaces = allTypes.Select(t => t.Namespace).Distinct().ToList();
+            var notFoundNamespaces = namespaces.Where(ns => !availableNamespaces.Contains(ns)).ToList();
+            
+            if (notFoundNamespaces.Any())
+            {
+                return JsonSerializer.Serialize(new { 
+                    error = $"Namespace(s) not found: {string.Join(", ", notFoundNamespaces)}",
+                    availableNamespaces = availableNamespaces.OrderBy(ns => ns).ToList()
+                });
+            }
+
+            var filteredTypes = allTypes
+                .Where(t => namespaces.Contains(t.Namespace))
                 .Select(type => new TypeMetadata
                 {
                     Name = type.Name,
                     Namespace = type.Namespace,
                     FullName = type.FullName,
                     Documentation = comments.GetValueOrDefault(GetXmlDocKey(type)),
+                    MethodCount = type.Methods.Count(m => m.IsPublic && !m.IsConstructor && !m.IsGetter && !m.IsSetter),
+                    PropertyCount = type.Properties.Count(p => p.GetMethod?.IsPublic ?? false),
+                    Methods = null,
+                    Properties = null
+                })
+                .OrderBy(t => t.Namespace)
+                .ThenBy(t => t.Name)
+                .ToList();
+
+            return JsonSerializer.Serialize(new { Types = filteredTypes }, 
+                new JsonSerializerOptions { WriteIndented = true, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });
+        }
+
+        // Mode 3: Filter by class names - return detailed member information
+        if (classNames != null)
+        {
+            var availableClasses = allTypes.Select(t => t.FullName).ToList();
+            var notFoundClasses = classNames.Where(cn => !availableClasses.Contains(cn)).ToList();
+            
+            if (notFoundClasses.Any())
+            {
+                return JsonSerializer.Serialize(new { 
+                    error = $"Class(es) not found: {string.Join(", ", notFoundClasses)}",
+                    availableClasses = availableClasses.OrderBy(cn => cn).ToList()
+                });
+            }
+
+            var filteredTypes = allTypes
+                .Where(t => classNames.Contains(t.FullName))
+                .Select(type => new TypeMetadata
+                {
+                    Name = type.Name,
+                    Namespace = type.Namespace,
+                    FullName = type.FullName,
+                    Documentation = comments.GetValueOrDefault(GetXmlDocKey(type)),
+                    MethodCount = null,
+                    PropertyCount = null,
                     Methods = type.Methods
                         .Where(m => m.IsPublic && !m.IsConstructor && !m.IsGetter && !m.IsSetter)
                         .Select(method => new MethodMetadata
@@ -52,10 +155,13 @@ public class Extractor
                             Type = prop.PropertyType.FullName,
                             Documentation = comments.GetValueOrDefault(GetXmlDocKey(prop))
                         }).ToList()
-                }).ToList()
-        };
+                }).ToList();
 
-        return JsonSerializer.Serialize(metadata, new JsonSerializerOptions { WriteIndented = true, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });
+            return JsonSerializer.Serialize(new { Types = filteredTypes }, 
+                new JsonSerializerOptions { WriteIndented = true, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });
+        }
+
+        return JsonSerializer.Serialize(new { error = "Invalid filter parameters." });
     }
 
     private string ConvertWslPathToWindowsPath(string path)
@@ -109,14 +215,23 @@ public class AssemblyMetadata
     public required List<TypeMetadata> Types { get; init; }
 }
 
+public class NamespaceMetadata
+{
+    public required string Name { get; init; }
+    public required int ClassCount { get; init; }
+    public required List<string> ClassNames { get; init; }
+}
+
 public class TypeMetadata
 {
     public required string Name { get; init; }
     public required string Namespace { get; init; }
     public required string FullName { get; init; }
     public string? Documentation { get; init; }
-    public required List<MethodMetadata> Methods { get; init; }
-    public required List<PropertyMetadata> Properties { get; init; }
+    public int? MethodCount { get; init; }
+    public int? PropertyCount { get; init; }
+    public List<MethodMetadata>? Methods { get; init; }
+    public List<PropertyMetadata>? Properties { get; init; }
 }
 
 public class MethodMetadata
